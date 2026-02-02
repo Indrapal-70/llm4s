@@ -28,7 +28,8 @@ import java.time.Instant
  */
 final case class InMemoryStore private (
   private val memories: Map[MemoryId, Memory],
-  config: MemoryStoreConfig
+  config: MemoryStoreConfig,
+  private val embeddingService: Option[EmbeddingService] = None
 ) extends MemoryStore {
 
   override def store(memory: Memory): Result[MemoryStore] = {
@@ -75,9 +76,28 @@ final case class InMemoryStore private (
     val hasEmbeddings = filtered.exists(_.isEmbedded)
 
     if (hasEmbeddings) {
-      // TODO: Implement vector similarity search when embeddings are available
-      // For now, fall back to keyword search
-      keywordSearch(query, filtered, topK)
+      (filtered.collect { case m if m.embedding.isDefined => m }, embeddingService) match {
+        case (embeddedMemories, Some(service)) if embeddedMemories.nonEmpty =>
+          service.embed(query).flatMap { queryEmbedding =>
+            val candidates = embeddedMemories.flatMap { memory =>
+              memory.embedding.flatMap { vector =>
+                if (vector.length != queryEmbedding.length) {
+                  None
+                } else {
+                  val similarity = VectorOps.cosineSimilarity(queryEmbedding, vector)
+                  val score      = math.max(0.0, math.min(1.0, (similarity + 1.0) / 2.0))
+                  Some(ScoredMemory(memory, score))
+                }
+              }
+            }
+
+            if (candidates.isEmpty) keywordSearch(query, filtered, topK)
+            else Right(candidates.sorted(ScoredMemory.byScoreDescending).take(topK))
+          }
+
+        case _ =>
+          keywordSearch(query, filtered, topK)
+      }
     } else {
       keywordSearch(query, filtered, topK)
     }
@@ -159,8 +179,19 @@ object InMemoryStore {
   /**
    * Create an empty in-memory store with custom configuration.
    */
-  def apply(config: MemoryStoreConfig = MemoryStoreConfig.default): InMemoryStore =
+  def apply(config: MemoryStoreConfig): InMemoryStore =
     InMemoryStore(Map.empty, config)
+
+  /**
+   * Create an empty in-memory store with an embedding service.
+   *
+   * When provided, the store can perform embedding-based semantic search.
+   */
+  def withEmbeddingService(
+    service: EmbeddingService,
+    config: MemoryStoreConfig = MemoryStoreConfig.default
+  ): InMemoryStore =
+    InMemoryStore(Map.empty, config, Some(service))
 
   /**
    * Create a store pre-populated with memories.
