@@ -1,6 +1,7 @@
 package org.llm4s.agent.memory
 
 import org.llm4s.error.NotFoundError
+import org.llm4s.error.ValidationError
 import org.llm4s.types.Result
 
 import java.time.Instant
@@ -15,13 +16,14 @@ import java.time.Instant
  * Features:
  * - Fast lookups using indexed data structures
  * - Basic keyword search (semantic search requires embeddings)
- * - Thread-safe for concurrent access
+ * - Immutable design (returns new store on every write)
  * - No external dependencies
  *
  * Limitations:
  * - Data is lost when the application terminates
  * - Memory usage grows with stored memories
  * - Keyword search is less sophisticated than vector search
+ * - Not thread-safe without external synchronization (returns new store, so caller must handle atomic swaps)
  *
  * @param memories All stored memories indexed by ID
  * @param config Configuration options
@@ -105,18 +107,26 @@ final case class InMemoryStore private (
 
   /**
    * Simple keyword-based search scoring.
+   * Tokenizes both query and content for symmetric term matching,
+   * avoiding substring matches that can inflate scores.
    */
   private def keywordSearch(
     query: String,
     memories: Seq[Memory],
     topK: Int
   ): Result[Seq[ScoredMemory]] = {
-    val queryTerms = query.toLowerCase.split("\\s+").toSet
+    def tokenize(s: String): Set[String] =
+      s.toLowerCase.split("[^\\p{L}\\p{N}]+").filter(_.nonEmpty).toSet
+
+    val queryTerms = tokenize(query)
+    if (queryTerms.isEmpty) {
+      return Right(Seq.empty)
+    }
 
     val scored = memories.map { memory =>
-      val content      = memory.content.toLowerCase
-      val matchedTerms = queryTerms.count(content.contains)
-      val score        = if (queryTerms.isEmpty) 0.0 else matchedTerms.toDouble / queryTerms.size
+      val contentTerms = tokenize(memory.content)
+      val matchedTerms = queryTerms.intersect(contentTerms).size
+      val score        = matchedTerms.toDouble / queryTerms.size
       ScoredMemory(memory, score)
     }
 
@@ -131,16 +141,23 @@ final case class InMemoryStore private (
   override def delete(id: MemoryId): Result[MemoryStore] =
     Right(copy(memories = memories - id))
 
-  override def deleteMatching(filter: MemoryFilter): Result[MemoryStore] = {
-    val idsToDelete = memories.values.filter(filter.matches).map(_.id).toSet
-    Right(copy(memories = memories.filterNot { case (id, _) => idsToDelete.contains(id) }))
-  }
+  override def deleteMatching(filter: MemoryFilter): Result[MemoryStore] =
+    Right(copy(memories = memories.filterNot { case (_, memory) => filter.matches(memory) }))
 
   override def update(id: MemoryId, updateFn: Memory => Memory): Result[MemoryStore] =
     memories.get(id) match {
       case Some(memory) =>
         val updated = updateFn(memory)
-        Right(copy(memories = memories + (id -> updated)))
+        if (updated.id != id) {
+          Left(
+            ValidationError(
+              "id",
+              s"update function changed Memory ID from $id to ${updated.id}; IDs must remain constant"
+            )
+          )
+        } else {
+          Right(copy(memories = memories + (id -> updated)))
+        }
 
       case None =>
         Left(NotFoundError(s"Memory not found: $id", id.value))
@@ -199,8 +216,14 @@ object InMemoryStore {
   def withMemories(memories: Seq[Memory]): Result[InMemoryStore] = {
     val store = empty
     memories
-      .foldLeft[Result[MemoryStore]](Right(store))((acc, memory) => acc.flatMap(_.store(memory)))
-      .map(_.asInstanceOf[InMemoryStore])
+      .foldLeft[Result[InMemoryStore]](Right(store)) { (acc, memory) =>
+        acc.flatMap { s =>
+          s.store(memory).flatMap {
+            case next: InMemoryStore => Right(next)
+            case other => Left(ValidationError("store", s"Expected InMemoryStore but got ${other.getClass.getName}"))
+          }
+        }
+      }
   }
 
   /**
