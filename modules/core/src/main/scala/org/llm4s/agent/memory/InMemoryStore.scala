@@ -31,7 +31,7 @@ import java.time.Instant
 final case class InMemoryStore private (
   private val memories: Map[MemoryId, Memory],
   config: MemoryStoreConfig,
-  private val embeddingService: Option[EmbeddingService] = None
+  private val embeddingService: Option[EmbeddingService]
 ) extends MemoryStore {
 
   override def store(memory: Memory): Result[MemoryStore] = {
@@ -80,21 +80,31 @@ final case class InMemoryStore private (
     if (hasEmbeddings) {
       (filtered.collect { case m if m.embedding.isDefined => m }, embeddingService) match {
         case (embeddedMemories, Some(service)) if embeddedMemories.nonEmpty =>
-          service.embed(query).flatMap { queryEmbedding =>
-            val candidates = embeddedMemories.flatMap { memory =>
-              memory.embedding.flatMap { vector =>
-                if (vector.length != queryEmbedding.length) {
-                  None
-                } else {
-                  val similarity = VectorOps.cosineSimilarity(queryEmbedding, vector)
-                  val score      = math.max(0.0, math.min(1.0, (similarity + 1.0) / 2.0))
-                  Some(ScoredMemory(memory, score))
+          service.embed(query) match {
+            case Right(queryEmbedding) =>
+              val candidates = embeddedMemories.flatMap { memory =>
+                memory.embedding.flatMap { vector =>
+                  if (vector.length != queryEmbedding.length) {
+                    None
+                  } else if (containsNonFinite(vector) || containsNonFinite(queryEmbedding)) {
+                    // Skip memories or queries with non-finite values
+                    None
+                  } else {
+                    val similarity = VectorOps.cosineSimilarity(queryEmbedding, vector)
+                    // Normalize to 0-1 range
+                    val normalizedSimilarity = (similarity + 1.0) / 2.0
+                    val score                = math.max(0.0, math.min(1.0, normalizedSimilarity))
+                    Some(ScoredMemory(memory, score))
+                  }
                 }
               }
-            }
 
-            if (candidates.isEmpty) keywordSearch(query, filtered, topK)
-            else Right(candidates.sorted(ScoredMemory.byScoreDescending).take(topK))
+              if (candidates.isEmpty) keywordSearch(query, filtered, topK)
+              else Right(candidates.sorted(ScoredMemory.byScoreDescending).take(topK))
+
+            case Left(_) =>
+              // Fallback to keyword search when embedding fails
+              keywordSearch(query, filtered, topK)
           }
 
         case _ =>
@@ -136,6 +146,18 @@ final case class InMemoryStore private (
       .take(topK)
 
     Right(sorted)
+  }
+
+  /**
+   * Check if an array contains any non-finite values (NaN, Inf, -Inf).
+   */
+  private def containsNonFinite(arr: Array[Float]): Boolean = {
+    var i = 0
+    while (i < arr.length) {
+      if (!java.lang.Float.isFinite(arr(i))) return true
+      i += 1
+    }
+    false
   }
 
   override def delete(id: MemoryId): Result[MemoryStore] =
@@ -191,13 +213,13 @@ object InMemoryStore {
   /**
    * Create an empty in-memory store with default configuration.
    */
-  def empty: InMemoryStore = InMemoryStore(Map.empty, MemoryStoreConfig.default)
+  def empty: InMemoryStore = InMemoryStore(Map.empty, MemoryStoreConfig.default, None)
 
   /**
    * Create an empty in-memory store with custom configuration.
    */
   def apply(config: MemoryStoreConfig): InMemoryStore =
-    InMemoryStore(Map.empty, config)
+    InMemoryStore(Map.empty, config, None)
 
   /**
    * Create an empty in-memory store with an embedding service.
