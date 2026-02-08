@@ -16,22 +16,20 @@ import java.time.Instant
  * Features:
  * - Fast lookups using indexed data structures
  * - Basic keyword search (semantic search requires embeddings)
- * - Immutable design (returns new store on every write)
+ * - Thread-safe for concurrent access
  * - No external dependencies
  *
  * Limitations:
  * - Data is lost when the application terminates
  * - Memory usage grows with stored memories
  * - Keyword search is less sophisticated than vector search
- * - Not thread-safe without external synchronization (returns new store, so caller must handle atomic swaps)
  *
  * @param memories All stored memories indexed by ID
  * @param config Configuration options
  */
 final case class InMemoryStore private (
   private val memories: Map[MemoryId, Memory],
-  config: MemoryStoreConfig,
-  private val embeddingService: Option[EmbeddingService]
+  config: MemoryStoreConfig
 ) extends MemoryStore {
 
   override def store(memory: Memory): Result[MemoryStore] = {
@@ -78,38 +76,9 @@ final case class InMemoryStore private (
     val hasEmbeddings = filtered.exists(_.isEmbedded)
 
     if (hasEmbeddings) {
-      (filtered.collect { case m if m.embedding.isDefined => m }, embeddingService) match {
-        case (embeddedMemories, Some(service)) if embeddedMemories.nonEmpty =>
-          service.embed(query) match {
-            case Right(queryEmbedding) =>
-              val candidates = embeddedMemories.flatMap { memory =>
-                memory.embedding.flatMap { vector =>
-                  if (vector.length != queryEmbedding.length) {
-                    None
-                  } else if (containsNonFinite(vector) || containsNonFinite(queryEmbedding)) {
-                    // Skip memories or queries with non-finite values
-                    None
-                  } else {
-                    val similarity = VectorOps.cosineSimilarity(queryEmbedding, vector)
-                    // Normalize to 0-1 range
-                    val normalizedSimilarity = (similarity + 1.0) / 2.0
-                    val score                = math.max(0.0, math.min(1.0, normalizedSimilarity))
-                    Some(ScoredMemory(memory, score))
-                  }
-                }
-              }
-
-              if (candidates.isEmpty) keywordSearch(query, filtered, topK)
-              else Right(candidates.sorted(ScoredMemory.byScoreDescending).take(topK))
-
-            case Left(_) =>
-              // Fallback to keyword search when embedding fails
-              keywordSearch(query, filtered, topK)
-          }
-
-        case _ =>
-          keywordSearch(query, filtered, topK)
-      }
+      // TODO: Implement vector similarity search when embeddings are available
+      // For now, fall back to keyword search
+      keywordSearch(query, filtered, topK)
     } else {
       keywordSearch(query, filtered, topK)
     }
@@ -117,26 +86,18 @@ final case class InMemoryStore private (
 
   /**
    * Simple keyword-based search scoring.
-   * Tokenizes both query and content for symmetric term matching,
-   * avoiding substring matches that can inflate scores.
    */
   private def keywordSearch(
     query: String,
     memories: Seq[Memory],
     topK: Int
   ): Result[Seq[ScoredMemory]] = {
-    def tokenize(s: String): Set[String] =
-      s.toLowerCase.split("[^\\p{L}\\p{N}]+").filter(_.nonEmpty).toSet
-
-    val queryTerms = tokenize(query)
-    if (queryTerms.isEmpty) {
-      return Right(Seq.empty)
-    }
+    val queryTerms = query.toLowerCase.split("\\s+").toSet
 
     val scored = memories.map { memory =>
-      val contentTerms = tokenize(memory.content)
-      val matchedTerms = queryTerms.intersect(contentTerms).size
-      val score        = matchedTerms.toDouble / queryTerms.size
+      val content      = memory.content.toLowerCase
+      val matchedTerms = queryTerms.count(content.contains)
+      val score        = if (queryTerms.isEmpty) 0.0 else matchedTerms.toDouble / queryTerms.size
       ScoredMemory(memory, score)
     }
 
@@ -148,23 +109,13 @@ final case class InMemoryStore private (
     Right(sorted)
   }
 
-  /**
-   * Check if an array contains any non-finite values (NaN, Inf, -Inf).
-   */
-  private def containsNonFinite(arr: Array[Float]): Boolean = {
-    var i = 0
-    while (i < arr.length) {
-      if (!java.lang.Float.isFinite(arr(i))) return true
-      i += 1
-    }
-    false
-  }
-
   override def delete(id: MemoryId): Result[MemoryStore] =
     Right(copy(memories = memories - id))
 
-  override def deleteMatching(filter: MemoryFilter): Result[MemoryStore] =
-    Right(copy(memories = memories.filterNot { case (_, memory) => filter.matches(memory) }))
+  override def deleteMatching(filter: MemoryFilter): Result[MemoryStore] = {
+    val idsToDelete = memories.values.filter(filter.matches).map(_.id).toSet
+    Right(copy(memories = memories.filterNot { case (id, _) => idsToDelete.contains(id) }))
+  }
 
   override def update(id: MemoryId, updateFn: Memory => Memory): Result[MemoryStore] =
     memories.get(id) match {
@@ -213,24 +164,25 @@ object InMemoryStore {
   /**
    * Create an empty in-memory store with default configuration.
    */
-  def empty: InMemoryStore = InMemoryStore(Map.empty, MemoryStoreConfig.default, None)
+  def empty: InMemoryStore = InMemoryStore(Map.empty, MemoryStoreConfig.default)
 
   /**
    * Create an empty in-memory store with custom configuration.
    */
-  def apply(config: MemoryStoreConfig): InMemoryStore =
-    InMemoryStore(Map.empty, config, None)
+  def apply(config: MemoryStoreConfig = MemoryStoreConfig.default): InMemoryStore =
+    InMemoryStore(Map.empty, config)
 
   /**
    * Create an empty in-memory store with an embedding service.
    *
    * When provided, the store can perform embedding-based semantic search.
+   * Returns an EmbeddingMemoryStore that wraps an InMemoryStore.
    */
   def withEmbeddingService(
     service: EmbeddingService,
     config: MemoryStoreConfig = MemoryStoreConfig.default
-  ): InMemoryStore =
-    InMemoryStore(Map.empty, config, Some(service))
+  ): EmbeddingMemoryStore =
+    EmbeddingMemoryStore(InMemoryStore(config), service)
 
   /**
    * Create a store pre-populated with memories.
@@ -238,14 +190,8 @@ object InMemoryStore {
   def withMemories(memories: Seq[Memory]): Result[InMemoryStore] = {
     val store = empty
     memories
-      .foldLeft[Result[InMemoryStore]](Right(store)) { (acc, memory) =>
-        acc.flatMap { s =>
-          s.store(memory).flatMap {
-            case next: InMemoryStore => Right(next)
-            case other => Left(ValidationError("store", s"Expected InMemoryStore but got ${other.getClass.getName}"))
-          }
-        }
-      }
+      .foldLeft[Result[MemoryStore]](Right(store))((acc, memory) => acc.flatMap(_.store(memory)))
+      .map(_.asInstanceOf[InMemoryStore])
   }
 
   /**
