@@ -1,5 +1,6 @@
 package org.llm4s.agent
 
+import org.llm4s.agent.streaming.AgentEvent
 import org.llm4s.llmconnect.LLMClient
 import org.llm4s.llmconnect.model._
 import org.llm4s.toolapi._
@@ -7,6 +8,8 @@ import org.scalamock.scalatest.MockFactory
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import upickle.default._
+
+import scala.collection.mutable.ArrayBuffer
 
 class AgentToolFailureTest extends AnyFlatSpec with Matchers with MockFactory {
 
@@ -595,5 +598,138 @@ class AgentToolFailureTest extends AnyFlatSpec with Matchers with MockFactory {
     pe("kind").str shouldBe "invalid_nesting"
     pe("expectedType").str shouldBe "object"
     pe("receivedType").str shouldBe "array"
+  }
+
+  // ============================================================================
+  // Additional tests for coverage completeness
+  // ============================================================================
+
+  "ToolCallErrorJson" should "handle MissingParameter without available parameters" in {
+    // Test case: MissingParameter with empty availableParameters list
+    val paramErrors = List(ToolParameterError.MissingParameter("username", "string", Nil))
+    val error       = ToolCallError.InvalidArguments("user_tool", paramErrors)
+    val json        = ToolCallErrorJson.toJson(error)
+
+    json("parameterErrors").arr should have size 1
+    val pe = json("parameterErrors")(0)
+    pe("parameterName").str shouldBe "username"
+    pe("kind").str shouldBe "missing_parameter"
+    pe("expectedType").str shouldBe "string"
+    pe("receivedType") shouldBe ujson.Null
+    // Should NOT have availableParameters field when list is empty
+    pe.obj.get("availableParameters") shouldBe None
+  }
+
+  "ToolCallErrorJson.parameterErrorToJson" should "handle MultipleErrors directly" in {
+    // Tests the fallback case in parameterErrorToJson for MultipleErrors
+    // This case shouldn't normally occur (errors are flattened), but should handle gracefully
+    val multiError = ToolParameterError.MultipleErrors(
+      List(
+        ToolParameterError.MissingParameter("field1", "string"),
+        ToolParameterError.TypeMismatch("field2", "integer", "boolean")
+      )
+    )
+    val json = ToolCallErrorJson.parameterErrorToJson(multiError)
+
+    json("parameterName").str shouldBe "field1, field2"
+    json("kind").str shouldBe "multiple_errors"
+  }
+
+  "MissingParameter.getMessage" should "include available parameters when present" in {
+    val error = ToolParameterError.MissingParameter("query", "string", List("q", "search", "term"))
+    error.getMessage should include("available: q, search, term")
+  }
+
+  "MissingParameter.getMessage" should "not include available hint when list is empty" in {
+    val error = ToolParameterError.MissingParameter("query", "string", Nil)
+    error.getMessage shouldBe "required parameter 'query' (type: string) is missing"
+    (error.getMessage should not).include("available")
+  }
+
+  // ============================================================================
+  // Test for streaming events with tool failure (covers Agent line 1383)
+  // ============================================================================
+
+  /**
+   * Simple mock LLMClient for testing tool failures with streaming events.
+   */
+  class StreamingMockLLMClient(responses: Seq[Either[org.llm4s.error.APIError, Completion]]) extends LLMClient {
+
+    private var callIndex = 0
+
+    override def complete(
+      conversation: Conversation,
+      options: CompletionOptions
+    ): Either[org.llm4s.error.APIError, Completion] = {
+      val result = if (callIndex < responses.size) responses(callIndex) else responses.last
+      callIndex += 1
+      result
+    }
+
+    override def streamComplete(
+      conversation: Conversation,
+      options: CompletionOptions,
+      onChunk: StreamedChunk => Unit
+    ): Either[org.llm4s.error.APIError, Completion] = complete(conversation, options)
+
+    override def getContextWindow(): Int     = 4096
+    override def getReserveCompletion(): Int = 1024
+  }
+
+  "Agent.runWithEvents" should "emit ToolCallFailed event when tool execution fails" in {
+    // Create a tool that always fails
+    val failingTool  = createFailingTool("failing_stream_tool", "Simulated streaming failure")
+    val toolRegistry = new ToolRegistry(Seq(failingTool))
+
+    // Create tool call response
+    val toolCall = ToolCall(
+      id = "stream_call_001",
+      name = "failing_stream_tool",
+      arguments = ujson.Obj("item" -> "test", "quantity" -> 1)
+    )
+    val toolCallResponse = AssistantMessage(
+      contentOpt = Some("Let me use the tool"),
+      toolCalls = Seq(toolCall)
+    )
+    val completion1 = Completion(
+      id = "comp-1",
+      created = System.currentTimeMillis() / 1000,
+      content = toolCallResponse.content,
+      model = "test-model",
+      message = toolCallResponse,
+      toolCalls = List(toolCall),
+      usage = Some(TokenUsage(10, 10, 20))
+    )
+
+    // Final response after tool error
+    val finalResponse = AssistantMessage(contentOpt = Some("Tool failed, sorry."))
+    val completion2 = Completion(
+      id = "comp-2",
+      created = System.currentTimeMillis() / 1000,
+      content = finalResponse.content,
+      model = "test-model",
+      message = finalResponse,
+      toolCalls = Nil,
+      usage = Some(TokenUsage(10, 10, 20))
+    )
+
+    val mockClient = new StreamingMockLLMClient(Seq(Right(completion1), Right(completion2)))
+    val agent      = new Agent(mockClient)
+
+    val events = ArrayBuffer[AgentEvent]()
+
+    val result = agent.runWithEvents(
+      query = "Use the failing tool",
+      tools = toolRegistry,
+      onEvent = events += _
+    )
+
+    result.isRight shouldBe true
+
+    // Should have received ToolCallFailed event
+    val failedEvents = events.collect { case e: AgentEvent.ToolCallFailed => e }
+    failedEvents should have size 1
+    failedEvents.head.toolName shouldBe "failing_stream_tool"
+    failedEvents.head.error should include("isError")
   }
 }
